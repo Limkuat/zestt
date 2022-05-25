@@ -2,17 +2,17 @@ package main
 
 import (
 	"context"
-	"encoding/binary"
 	"io"
 	"log"
 	"os"
 	"os/exec"
+	"time"
 
 	speech "cloud.google.com/go/speech/apiv1"
 	speechpb "google.golang.org/genproto/googleapis/cloud/speech/v1"
 )
 
-const input = "/path/to/input"
+const input = "rtmp://localhost/live/test"
 
 func main() {
 	apiKey := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS")
@@ -32,9 +32,12 @@ func runFF() error {
 		"-vn",
 		"-c:a", "libopus",
 		"-b:a", "64k",
+		"-ac", "1", // mono
+		"-ar", "16k", // sample rate
 		"-f", "ogg",
 		"-",
 	)
+
 	log.Println("Run command:", cmd)
 
 	out, err := cmd.StdoutPipe()
@@ -61,10 +64,14 @@ func runFF() error {
 	stream.Send(&speechpb.StreamingRecognizeRequest{
 		StreamingRequest: &speechpb.StreamingRecognizeRequest_StreamingConfig{
 			StreamingConfig: &speechpb.StreamingRecognitionConfig{
+				SingleUtterance: false,
+				InterimResults:  true, // We need this to have GCP correct and send the detected text continuously.
 				Config: &speechpb.RecognitionConfig{
 					Encoding:        speechpb.RecognitionConfig_OGG_OPUS,
-					SampleRateHertz: 48000,
+					SampleRateHertz: 16000,
 					LanguageCode:    "fr-FR",
+					UseEnhanced:     true,      // Better, but costs more $$$
+					Model:           "default", // Switch to "video" when fr-FR is supported
 				},
 			},
 		},
@@ -80,8 +87,15 @@ func runFF() error {
 		for {
 			resp, err := stream.Recv()
 			if err == io.EOF {
-				log.Println("EOF")
+				log.Println("Recv EOF")
+				return
 			}
+			if err != nil {
+				log.Println("GCP Error:", err)
+				time.Sleep(1 * time.Second)
+				continue
+			}
+			log.Printf("Waiting for results....")
 			for _, result := range resp.Results {
 				log.Printf("Result: %+v\n", result)
 			}
@@ -89,23 +103,32 @@ func runFF() error {
 	}()
 
 	cmd.Start()
-	buf := make([]byte, 512)
 	for {
+		buf := make([]byte, 1024)
 		n, err := out.Read(buf)
+		if n == 0 {
+			log.Println("Too soon: sleep 100ms")
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
 		if err == io.EOF {
+			log.Println("EOF!")
 			stream.CloseSend()
+			return nil
 		}
 		if err != nil {
-			break
+			log.Println(err)
+			time.Sleep(1 * time.Second)
+			continue
 		}
-		binary.Write(os.Stdout, binary.LittleEndian, buf)
 		err = stream.Send(&speechpb.StreamingRecognizeRequest{
 			StreamingRequest: &speechpb.StreamingRecognizeRequest_AudioContent{
 				AudioContent: buf[:n],
 			},
 		})
 		if err != nil {
-			log.Fatal(err)
+			log.Println("Send error:", err)
+			time.Sleep(1 * time.Second)
 		}
 	}
 
